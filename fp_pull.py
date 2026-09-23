@@ -17,7 +17,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 
 import duckdb
-import pandas as pd
+import polars as pl
 from dotenv import load_dotenv
 
 BASE = "https://api.fantasypros.com/public/v2/json"
@@ -53,14 +53,14 @@ def fetch(con, path, params, max_age, force):
     req = urllib.request.Request(url, headers={"x-api-key": api_key(), "Accept": "application/json",
                                                 "User-Agent": "Mozilla/5.0 fantasyeval"})
     # AWS API Gateway throttles bursts (429); pace calls and back off.
-    for attempt in range(5):
+    for attempt in range(3):
         time.sleep(CALL_GAP_S * 2 ** attempt)
         try:
             with urllib.request.urlopen(req, timeout=30) as r:
                 body = r.read().decode()
             break
         except urllib.error.HTTPError as e:
-            if e.code != 429 or attempt == 4:
+            if e.code != 429 or attempt == 2:
                 raise
     con.execute("INSERT OR REPLACE INTO fp_raw VALUES (?, ?, ?)", [url, now, body])
     print(f"fetched {url}")
@@ -101,13 +101,11 @@ def load_player_ids(con):
 
 def replace(con, table, df, where):
     """Replace the slice of `table` matching `where` with df (creates table on first run)."""
-    con.register("df", df)
     if con.execute(f"SELECT count(*) FROM information_schema.tables WHERE table_name = '{table}'").fetchone()[0]:
         con.execute(f"DELETE FROM {table} WHERE {where}")
         con.execute(f"INSERT INTO {table} BY NAME SELECT * FROM df")
     else:
         con.execute(f"CREATE TABLE {table} AS SELECT * FROM df")
-    con.unregister("df")
 
 
 def pull(week, max_age, force):
@@ -118,20 +116,27 @@ def pull(week, max_age, force):
     load_player_ids(con)
 
     # Free tier returns max 10 players per call, so request the ESPN-owned pool 10 FP ids at a time.
-    pool = espn_owned_ids()
-    con.register("pool", pd.DataFrame({"espn_id": pool}))
+    pool = pl.DataFrame({"espn_id": espn_owned_ids()})
     targets = con.execute("""SELECT position, list(fp_id ORDER BY fp_id) FROM fp_player_map
                              JOIN pool USING (espn_id) WHERE position IN ('QB','RB','WR','TE') GROUP BY 1""").fetchall()
-    rows = []
-    for pos, ids in targets:
-        for i in range(0, len(ids), 10):
-            for ros in (False, True):
-                params = {"position": pos, "week": week, "players": ":".join(ids[i:i + 10])} | ({"ros": "true"} if ros else {})
-                for p in fetch(con, f"/nfl/{SEASON}/projections", params, **kw)["players"]:
-                    stats = p["stats"][0] if isinstance(p["stats"], list) else p["stats"]
-                    rows.append({"fp_id": str(p["fpid"]), "week": week, "ros": ros, "position": pos,
-                                 "fp_points": score(stats), **stats})
-    replace(con, "fp_projections", pd.DataFrame(rows), f"week = {week}")
+    rows, batches = [], [(pos, ids[i:i + 10], ros) for pos, ids in targets
+                         for i in range(0, len(ids), 10) for ros in (False, True)]
+    for n, (pos, batch, ros) in enumerate(batches):
+        params = {"position": pos, "week": week, "players": ":".join(batch)} | ({"ros": "true"} if ros else {})
+        try:
+            data = fetch(con, f"/nfl/{SEASON}/projections", params, **kw)
+        except urllib.error.HTTPError as e:
+            if e.code != 429:
+                raise
+            # Quota hit: keep what's cached so far; the next run resumes from the cache.
+            print(f"WARNING: FantasyPros quota hit after {n}/{len(batches)} batches; fp_projections is partial.")
+            break
+        for p in data["players"]:
+            stats = p["stats"][0] if isinstance(p["stats"], list) else p["stats"]
+            rows.append({"fp_id": str(p["fpid"]), "week": week, "ros": ros, "position": pos,
+                         "fp_points": score(stats), **stats})
+    if rows:
+        replace(con, "fp_projections", pl.from_dicts(rows, infer_schema_length=None), f"week = {week}")
     print(f"done: {len(pool)} ESPN pool players, {sum(len(i) for _, i in targets)} mapped to FP, {len(rows)} projection rows")
 
 
