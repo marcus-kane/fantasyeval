@@ -30,6 +30,7 @@ from espn_api.requests.espn_requests import ESPNAccessDenied, ESPNInvalidLeague,
 
 import fp_pull
 import rankings_csv
+import value
 from auth import AuthError
 
 DB = fp_pull.DB
@@ -46,7 +47,7 @@ def connect_league(league_id, year, s2, swid):
     return lg
 
 
-def player_row(p, league_id, team_id):
+def player_row(p, league_id, team_id, weeks=range(0)):
     # espn-api uses [] for missing scalars on free agents (injuryStatus, etc.)
     return {k: None if v == [] and k != "eligible_slots" else v for k, v in {
         "league_id": league_id, "team_id": team_id, "espn_id": str(p.playerId), "name": p.name,
@@ -55,6 +56,7 @@ def player_row(p, league_id, team_id):
         "acquisition_type": p.acquisitionType or None, "percent_owned": p.percent_owned,
         "percent_started": p.percent_started, "avg_points": p.avg_points, "total_points": p.total_points,
         "projected_avg_points": p.projected_avg_points, "projected_total_points": p.projected_total_points,
+        "games_remaining": sum(1 for wk in (p.schedule or {}) if int(wk) in weeks),  # byes excluded
     }.items()}
 
 
@@ -66,6 +68,8 @@ def league_rows(lg, league_id, swid):
     """Flatten one espn-api League into {table: [rows]}."""
     s = lg.settings
     me = next((t.team_id for t in lg.teams if is_me(t, swid)), None)
+    last_week = max(max(v) for v in s.matchup_periods.values())  # fantasy season incl. playoffs
+    weeks = range(lg.current_week, last_week + 1)
     out = {k: [] for k in ("espn_leagues", "espn_slots", "espn_scoring", "espn_teams", "espn_players",
                            "espn_player_weeks", "espn_lineups", "espn_schedule")}
     out["espn_leagues"].append({
@@ -73,7 +77,7 @@ def league_rows(lg, league_id, swid):
         "current_week": lg.current_week, "reg_season_count": s.reg_season_count,
         "playoff_team_count": s.playoff_team_count, "scoring_type": s.scoring_type,
         "trade_deadline": datetime.fromtimestamp(s.trade_deadline / 1000, timezone.utc) if s.trade_deadline else None,
-        "my_team_id": me,
+        "last_week": last_week, "my_team_id": me,
     })
     out["espn_slots"] += [{"league_id": league_id, "slot": k, "count": v}
                           for k, v in s.position_slot_counts.items() if v]
@@ -87,7 +91,7 @@ def league_rows(lg, league_id, swid):
             "points_for": t.points_for, "points_against": t.points_against, "standing": t.standing,
         })
         for p in t.roster:
-            out["espn_players"].append(player_row(p, league_id, t.team_id))
+            out["espn_players"].append(player_row(p, league_id, t.team_id, weeks))
             out["espn_player_weeks"] += [
                 {"league_id": league_id, "espn_id": str(p.playerId), "week": wk,
                  "points": st.get("points"), "projected_points": st.get("projected_points")}
@@ -96,7 +100,7 @@ def league_rows(lg, league_id, swid):
             out["espn_schedule"].append({
                 "league_id": league_id, "week": wk, "team_id": t.team_id, "opp_team_id": opp.team_id,
                 "score": score if outcome != "U" else None, "outcome": outcome})
-    out["espn_players"] += [player_row(p, league_id, None) for p in lg.free_agents(size=FREE_AGENTS)]
+    out["espn_players"] += [player_row(p, league_id, None, weeks) for p in lg.free_agents(size=FREE_AGENTS)]
     for wk in range(1, lg.current_week + 1):
         for bs in lg.box_scores(wk):
             for team, lineup in ((bs.home_team, bs.home_lineup), (bs.away_team, bs.away_lineup)):
@@ -135,14 +139,15 @@ def main():
     a = ap.parse_args()
     with duckdb.connect(DB) as con:
         week = refresh_espn(con)
-    if a.espn:
-        return
-    try:
-        fp_pull.pull(week, timedelta(hours=20), a.force)
-    except urllib.error.HTTPError as e:
-        # FP free tier has an unpublished quota; cached batches survive for the next run.
-        print(f"WARNING: FantasyPros pull stopped ({e.code} {e.reason}); fp_projections is partial or stale.")
-    rankings_csv.load()
+    if not a.espn:
+        try:
+            fp_pull.pull(week, timedelta(hours=20), a.force)
+        except urllib.error.HTTPError as e:
+            # FP free tier has an unpublished quota; cached batches survive for the next run.
+            print(f"WARNING: FantasyPros pull stopped ({e.code} {e.reason}); fp_projections is partial or stale.")
+        rankings_csv.load()
+    with duckdb.connect(DB) as con:
+        print(f"player_values: {len(value.compute(con))} rows")
 
 
 if __name__ == "__main__":

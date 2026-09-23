@@ -1,4 +1,4 @@
-# fantasyeval
+﻿# fantasyeval
 
 Personal fantasy football tracker for 3 ESPN leagues: value model (VOR on my own rankings), lineup-based trade evaluator, and a win-win trade finder.
 
@@ -15,10 +15,10 @@ uv run pytest -q
 ## Files
 | File | Role |
 |---|---|
-| `auth.py` | Playwright persistent profile → espn_s2/SWID into `.env`; verifies each league, fails loudly on 401/empty rosters |
-| `refresh.py` | Single entrypoint. ESPN (espn-api) → `espn_*` tables for all leagues, then `fp_pull`, then `rankings_csv` |
-| `fp_pull.py` | FantasyPros projections → `fp_projections`, raw responses cached in `fp_raw`; loads `player_ids` |
-| `rankings_csv.py` | Manually exported FantasyPros ROS + Flock CSVs → `rankings` |
+| `auth.py` | Playwright persistent profile â†’ espn_s2/SWID into `.env`; verifies each league, fails loudly on 401/empty rosters |
+| `refresh.py` | Single entrypoint. ESPN (espn-api) â†’ `espn_*` tables for all leagues, then `fp_pull`, then `rankings_csv` |
+| `fp_pull.py` | FantasyPros projections â†’ `fp_projections`, raw responses cached in `fp_raw`; loads `player_ids` |
+| `rankings_csv.py` | Manually exported FantasyPros ROS + Flock CSVs â†’ `rankings` |
 
 ## Decisions
 - **IDs:** everything joins on ESPN id via `player_ids` (DynastyProcess `db_playerids.csv`: FP, ESPN, gsis/nflverse, sleeper...). Never join on names, except the CSV rankings, which only carry names (normalized name + position, first-initial fallback, `ALIASES` for nicknames).
@@ -28,7 +28,10 @@ uv run pytest -q
 - **FantasyPros free tier:** every response is capped at 10 players (use the `players=` filter, 10 ids per call), with an unpublished quota of roughly 45-50 calls/day (429). Only ESPN's 350 most-owned QB/RB/WR/TE are requested. A quota hit keeps partial data, and the next run resumes from the cache. FP rankings come from CSV exports, not the API.
 - **FP projections are raw stats**, scored by us. TODO: score from `espn_scoring` per league instead of the `SCORING` dict.
 - **Routes data is not available (paid).** Use snap share + target share.
+- **Replacement level** = best non-starter per position after filling dedicated slots, then flex slots by where the best leftovers are (narrow flexes first). See `value.replacement_levels` docstring.
+- **Overrides live in `player_overrides`** (global, not per league) and change projections, never values.
+- Phase 4 was built before 2c/3 so trades come sooner; nflverse features will later feed projections.
 - Stack: polars + DuckDB (no pandas). Business logic stays out of `app.py`.
 
 ## Phases
-1 auth ✅ · 2 refresh ✅ · 2b FantasyPros ✅ · 2c nflverse · 3 features · 4 value (VOR + overrides) · 5 trades (lineup-based + win-win finder) · 6 deficiencies · 7 Streamlit app · later: injury comps, backtest
+1 auth âœ… Â· 2 refresh âœ… Â· 2b FantasyPros âœ… Â· 2c nflverse Â· 3 features Â· 4 value (VOR + overrides) Â· 5 trades (lineup-based + win-win finder) Â· 6 deficiencies Â· 7 Streamlit app Â· later: injury comps, backtest

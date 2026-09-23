@@ -18,9 +18,11 @@ def test_player_row_blanks_empty_lists_but_keeps_slots():
     p = SimpleNamespace(playerId=1, name="X", position="WR", proTeam="DET", lineupSlot="WR",
                         eligibleSlots=[], injuryStatus=[], injured=False, acquisitionType=[],
                         percent_owned=1.0, percent_started=1.0, avg_points=0, total_points=0,
-                        projected_avg_points=0, projected_total_points=0)
-    row = player_row(p, 1, None)
+                        projected_avg_points=0, projected_total_points=0,
+                        schedule={"3": {}, "4": {}, "6": {}, "18": {}})
+    row = player_row(p, 1, None, weeks=range(4, 18))
     assert row["injury_status"] is None and row["eligible_slots"] == [] and row["lineup_slot"] is None
+    assert row["games_remaining"] == 2  # weeks 4 and 6; 3 is past, 18 is after the fantasy season
 
 
 def test_empty_rosters_fail_loudly(monkeypatch):
