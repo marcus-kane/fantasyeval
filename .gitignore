@@ -4,3 +4,4 @@ espn_profile/
 *.duckdb.wal
 .venv/
 __pycache__/
+*Rankings*.csv
