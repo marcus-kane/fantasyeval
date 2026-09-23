@@ -1,4 +1,4 @@
-"""Phase 2b: pull FantasyPros projections/rankings/player map into DuckDB.
+﻿"""Phase 2b: pull FantasyPros projections + DynastyProcess player ID map into DuckDB.
 
 Every API response is cached in fp_raw; a URL is only re-fetched when its cache
 row is older than --max-age-hours (default 20h => ~once a day). Run with --force
@@ -10,9 +10,12 @@ before lineups lock. The Streamlit app should only ever read the fp_* tables.
 import argparse
 import json
 import os
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
+
 import duckdb
 import pandas as pd
 from dotenv import load_dotenv
@@ -20,7 +23,9 @@ from dotenv import load_dotenv
 BASE = "https://api.fantasypros.com/public/v2/json"
 DB = "fantasy.duckdb"
 SEASON = 2026
-POSITIONS = ["QB", "RB", "WR", "TE"]
+PLAYER_IDS_URL = "https://raw.githubusercontent.com/dynastyprocess/data/master/files/db_playerids.csv"
+ESPN_POOL = 350  # ~12-14 teams x ~10 skill players + waiver wire
+CALL_GAP_S = 1.0  # FP rate limits are unpublished; raise this if 429s persist
 
 # League rules. FP projections are raw stats (scoring=STD), so we score them ourselves.
 SCORING = {
@@ -41,14 +46,22 @@ def api_key():
 def fetch(con, path, params, max_age, force):
     """GET with a DuckDB-backed cache keyed on the full URL."""
     url = f"{BASE}{path}?{urllib.parse.urlencode(params)}"
-    row = con.execute("SELECT fetched_at, body FROM fp_raw WHERE url = ?", [url]).fetchone()
+    row = con.execute("SELECT epoch(fetched_at), body FROM fp_raw WHERE url = ?", [url]).fetchone()
     now = datetime.now(timezone.utc)
-    if row and not force and now - row[0] < max_age:
+    if row and not force and now.timestamp() - row[0] < max_age.total_seconds():
         return json.loads(row[1])
     req = urllib.request.Request(url, headers={"x-api-key": api_key(), "Accept": "application/json",
                                                 "User-Agent": "Mozilla/5.0 fantasyeval"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        body = r.read().decode()
+    # AWS API Gateway throttles bursts (429); pace calls and back off.
+    for attempt in range(5):
+        time.sleep(CALL_GAP_S * 2 ** attempt)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                body = r.read().decode()
+            break
+        except urllib.error.HTTPError as e:
+            if e.code != 429 or attempt == 4:
+                raise
     con.execute("INSERT OR REPLACE INTO fp_raw VALUES (?, ?, ?)", [url, now, body])
     print(f"fetched {url}")
     data = json.loads(body)
@@ -62,10 +75,28 @@ def score(stats):
     return round(sum(float(stats.get(k) or 0) * w for k, w in SCORING.items()), 2)
 
 
-def espn_id(p):
-    # ponytail: spec doesn't show where external IDs land; covers flat and nested shapes.
-    v = p.get("espn_id") or (p.get("external_ids") or {}).get("espn")
-    return str(v) if v not in (None, "", 0, "0") else None
+def espn_owned_ids(limit=ESPN_POOL):
+    """ESPN ids of the most-owned QB/RB/WR/TE (rostered + realistic waiver adds)."""
+    load_dotenv(".env")
+    league = os.environ["LEAGUE_ID"].split(",")[0]
+    filt = {"players": {"filterSlotIds": {"value": [0, 2, 4, 6]}, "limit": limit,
+                        "sortPercOwned": {"sortPriority": 1, "sortAsc": False}}}
+    req = urllib.request.Request(
+        f"https://lm-api-reads.fantasy.espn.com/apis/v3/games/ffl/seasons/{SEASON}/segments/0/leagues/{league}?view=kona_player_info",
+        headers={"Cookie": f"espn_s2={os.environ['ESPN_S2']}; SWID={os.environ['SWID']}",
+                 "X-Fantasy-Filter": json.dumps(filt)})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        ids = [str(p["id"]) for p in json.load(r)["players"]]
+    if not ids:
+        raise SystemExit("ESPN player pool came back empty; run `uv run python auth.py`.")
+    return ids
+
+
+def load_player_ids(con):
+    """Cross-site ID table (FP, ESPN, gsis/nflverse, sleeper...). Everything joins through this."""
+    con.execute(f"CREATE OR REPLACE TABLE player_ids AS SELECT * FROM read_csv('{PLAYER_IDS_URL}', all_varchar=true, nullstr='NA')")
+    con.execute("""CREATE OR REPLACE VIEW fp_player_map AS SELECT fantasypros_id AS fp_id, espn_id, gsis_id,
+                   name, merge_name, position, team FROM player_ids WHERE fantasypros_id IS NOT NULL""")
 
 
 def replace(con, table, df, where):
@@ -84,37 +115,24 @@ def pull(week, max_age, force):
     con.execute("CREATE TABLE IF NOT EXISTS fp_raw (url TEXT PRIMARY KEY, fetched_at TIMESTAMPTZ, body TEXT)")
     kw = dict(max_age=max_age, force=force)
 
-    # Player map: FP id <-> ESPN id. Everything joins through this.
-    players = fetch(con, "/nfl/players", {"external_ids": "espn"}, **kw)["players"]
-    pmap = pd.DataFrame([{
-        "fp_id": str(p["player_id"]), "espn_id": espn_id(p), "name": p["player_name"],
-        "position": p["position_id"], "team": p["team_id"],
-    } for p in players])
-    replace(con, "fp_player_map", pmap, "true")
+    load_player_ids(con)
 
-    # Projections: weekly + rest of season, raw stats + league points.
+    # Free tier returns max 10 players per call, so request the ESPN-owned pool 10 FP ids at a time.
+    pool = espn_owned_ids()
+    con.register("pool", pd.DataFrame({"espn_id": pool}))
+    targets = con.execute("""SELECT position, list(fp_id ORDER BY fp_id) FROM fp_player_map
+                             JOIN pool USING (espn_id) WHERE position IN ('QB','RB','WR','TE') GROUP BY 1""").fetchall()
     rows = []
-    for pos in POSITIONS:
-        for ros in (False, True):
-            params = {"position": pos, "week": week} | ({"ros": "true"} if ros else {})
-            for p in fetch(con, f"/nfl/{SEASON}/projections", params, **kw)["players"]:
-                stats = p["stats"][0] if isinstance(p["stats"], list) else p["stats"]
-                rows.append({"fp_id": str(p["fpid"]), "week": week, "ros": ros, "position": pos,
-                             "fp_points": score(stats), **stats})
+    for pos, ids in targets:
+        for i in range(0, len(ids), 10):
+            for ros in (False, True):
+                params = {"position": pos, "week": week, "players": ":".join(ids[i:i + 10])} | ({"ros": "true"} if ros else {})
+                for p in fetch(con, f"/nfl/{SEASON}/projections", params, **kw)["players"]:
+                    stats = p["stats"][0] if isinstance(p["stats"], list) else p["stats"]
+                    rows.append({"fp_id": str(p["fpid"]), "week": week, "ros": ros, "position": pos,
+                                 "fp_points": score(stats), **stats})
     replace(con, "fp_projections", pd.DataFrame(rows), f"week = {week}")
-
-    # Consensus rankings (PPR): weekly + ROS, kept as flat raw columns.
-    frames = []
-    for pos in POSITIONS:
-        for rtype, wk in (("WEEKLY", week), ("ROS", 0)):
-            params = {"position": pos, "scoring": "PPR", "week": wk} | ({"type": "ROS"} if rtype == "ROS" else {})
-            ranked = fetch(con, f"/nfl/{SEASON}/consensus-rankings", params, **kw)["players"]
-            df = pd.json_normalize(ranked).assign(week=week, rank_type=rtype, position=pos)
-            frames.append(df.rename(columns={"player_id": "fp_id"}).astype({"fp_id": str}))
-    replace(con, "fp_rankings", pd.concat(frames, ignore_index=True), f"week = {week}")
-
-    unmapped = con.execute("SELECT count(*) FROM fp_player_map WHERE espn_id IS NULL").fetchone()[0]
-    print(f"done: {len(pmap)} players ({unmapped} without ESPN id), {len(rows)} projection rows")
+    print(f"done: {len(pool)} ESPN pool players, {sum(len(i) for _, i in targets)} mapped to FP, {len(rows)} projection rows")
 
 
 if __name__ == "__main__":
