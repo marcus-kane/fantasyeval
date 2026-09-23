@@ -1,0 +1,6 @@
+.env
+espn_profile/
+*.duckdb
+*.duckdb.wal
+.venv/
+__pycache__/
